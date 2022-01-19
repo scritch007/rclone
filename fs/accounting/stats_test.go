@@ -391,6 +391,7 @@ func TestPruneTransfers(t *testing.T) {
 		Transfers                int
 		Limit                    int
 		ExpectedStartedTransfers int
+		ErrorTransfers           int
 	}{
 		{
 			Name:                     "Limited number of StartedTransfers",
@@ -403,6 +404,12 @@ func TestPruneTransfers(t *testing.T) {
 			Limit:                    -1,
 			Transfers:                200,
 			ExpectedStartedTransfers: 200,
+		}, {
+			Name:                     "Transfer errors should be kept when calling prune",
+			Limit:                    10,
+			Transfers:                200,
+			ExpectedStartedTransfers: 10 + ci.Transfers,
+			ErrorTransfers:           50,
 		},
 	} {
 		t.Run(test.Name, func(t *testing.T) {
@@ -411,27 +418,40 @@ func TestPruneTransfers(t *testing.T) {
 			defer func() { MaxCompletedTransfers = prevLimit }()
 
 			s := NewStats(ctx)
-			for i := int64(1); i <= int64(test.Transfers); i++ {
+
+			for i := int64(1); i <= int64(test.ErrorTransfers); i++ {
 				s.AddTransfer(&Transfer{
 					startedAt:   time.Unix(i, 0),
 					completedAt: time.Unix(i+1, 0),
+					stats:       s,
+					err:         fmt.Errorf("in error"),
+				})
+			}
+
+			for i := int64(1); i <= int64(test.Transfers); i++ {
+				s.AddTransfer(&Transfer{
+					startedAt:   time.Unix(int64(test.ErrorTransfers)+i, 0),
+					completedAt: time.Unix(int64(test.ErrorTransfers)+i+1, 0),
+					stats:       s,
 				})
 			}
 
 			s.mu.Lock()
-			assert.Equal(t, time.Duration(test.Transfers)*time.Second, s.totalDuration())
-			assert.Equal(t, test.Transfers, len(s.startedTransfers))
+			assert.Equal(t, time.Duration(test.Transfers+test.ErrorTransfers)*time.Second, s.totalDuration())
+			assert.Equal(t, test.Transfers+test.ErrorTransfers, len(s.startedTransfers))
 			s.mu.Unlock()
 
-			for i := 0; i < test.Transfers; i++ {
+			for i := 0; i < test.Transfers+test.ErrorTransfers; i++ {
 				s.PruneTransfers()
 			}
 
 			s.mu.Lock()
-			assert.Equal(t, time.Duration(test.Transfers)*time.Second, s.totalDuration())
+			assert.Equal(t, time.Duration(test.Transfers+test.ErrorTransfers)*time.Second, s.totalDuration())
 			assert.Equal(t, test.ExpectedStartedTransfers, len(s.startedTransfers))
+			assert.Equal(t, test.ErrorTransfers, len(s.errorsTransfers))
 			s.mu.Unlock()
 
+			assert.Equal(t, test.ExpectedStartedTransfers+test.ErrorTransfers, len(s.Transferred()))
 		})
 	}
 }

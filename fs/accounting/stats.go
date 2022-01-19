@@ -50,7 +50,8 @@ type StatsInfo struct {
 	deletes           int64
 	deletedDirs       int64
 	inProgress        *inProgress
-	startedTransfers  []*Transfer   // currently active transfers
+	startedTransfers  []*Transfer // currently active transfers
+	errorsTransfers   []*Transfer
 	oldTimeRanges     timeRanges    // a merged list of time ranges for the transfers
 	oldDuration       time.Duration // duration of transfers we have culled
 	group             string
@@ -212,13 +213,13 @@ func (trs timeRanges) total() (total time.Duration) {
 // Needs to be protected by mutex.
 func (s *StatsInfo) totalDuration() time.Duration {
 	// copy of s.oldTimeRanges with extra room for the current transfers
-	timeRanges := make(timeRanges, len(s.oldTimeRanges), len(s.oldTimeRanges)+len(s.startedTransfers))
+	timeRanges := make(timeRanges, len(s.oldTimeRanges), len(s.oldTimeRanges)+len(s.startedTransfers)+len(s.errorsTransfers))
 	copy(timeRanges, s.oldTimeRanges)
 
 	// Extract time ranges of all transfers.
 	now := time.Now()
-	for i := range s.startedTransfers {
-		start, end := s.startedTransfers[i].TimeRange()
+	for _, transfer := range append(s.startedTransfers, s.errorsTransfers...) {
+		start, end := transfer.TimeRange()
 		if end.IsZero() {
 			end = now
 		}
@@ -464,9 +465,9 @@ func (s *StatsInfo) String() string {
 func (s *StatsInfo) Transferred() []TransferSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	ts := make([]TransferSnapshot, 0, len(s.startedTransfers))
+	ts := make([]TransferSnapshot, 0, len(s.startedTransfers)+len(s.errorsTransfers))
 
-	for _, tr := range s.startedTransfers {
+	for _, tr := range append(s.startedTransfers, s.errorsTransfers...) {
 		if tr.IsDone() {
 			ts = append(ts, tr.Snapshot())
 		}
@@ -509,7 +510,7 @@ func (s *StatsInfo) GetBytesWithPending() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	pending := int64(0)
-	for _, tr := range s.startedTransfers {
+	for _, tr := range append(s.startedTransfers, s.errorsTransfers...) {
 		if tr.acc != nil {
 			bytes, size := tr.acc.progress()
 			if bytes < size {
@@ -616,6 +617,7 @@ func (s *StatsInfo) ResetCounters() {
 	s.deletedDirs = 0
 	s.renames = 0
 	s.startedTransfers = nil
+	s.errorsTransfers = nil
 	s.oldDuration = 0
 
 	s.stopAverageLoop()
@@ -762,7 +764,7 @@ func (s *StatsInfo) AddTransfer(transfer *Transfer) {
 // position i.
 //
 // Must be called with the lock held
-func (s *StatsInfo) removeTransfer(transfer *Transfer, i int) {
+func (s *StatsInfo) removeTransfer(list *[]*Transfer, transfer *Transfer, i int) {
 	now := time.Now()
 
 	// add finished transfer onto old time ranges
@@ -774,7 +776,7 @@ func (s *StatsInfo) removeTransfer(transfer *Transfer, i int) {
 	s.oldTimeRanges.merge()
 
 	// remove the found entry
-	s.startedTransfers = append(s.startedTransfers[:i], s.startedTransfers[i+1:]...)
+	*list = append((*list)[:i], (*list)[i+1:]...)
 
 	// Find youngest active transfer
 	oldestStart := now
@@ -792,13 +794,20 @@ func (s *StatsInfo) removeTransfer(transfer *Transfer, i int) {
 // RemoveTransfer removes a reference to the started transfer.
 func (s *StatsInfo) RemoveTransfer(transfer *Transfer) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for i, tr := range s.startedTransfers {
 		if tr == transfer {
-			s.removeTransfer(tr, i)
-			break
+			s.removeTransfer(&s.startedTransfers, tr, i)
+			return
 		}
 	}
-	s.mu.Unlock()
+	for i, tr := range s.errorsTransfers {
+		if tr == transfer {
+			s.removeTransfer(&s.errorsTransfers, tr, i)
+			return
+		}
+	}
+
 }
 
 // PruneTransfers makes sure there aren't too many old transfers by removing
@@ -812,7 +821,14 @@ func (s *StatsInfo) PruneTransfers() {
 	if len(s.startedTransfers) > MaxCompletedTransfers+s.ci.Transfers {
 		for i, tr := range s.startedTransfers {
 			if tr.IsDone() {
-				s.removeTransfer(tr, i)
+				fs.Infof(tr, "transfer is Done")
+				if tr.Snapshot().Error != nil {
+					fs.Infof(tr, "Transfer in error")
+					s.startedTransfers = append(s.startedTransfers[:i], s.startedTransfers[i+1:]...)
+					s.errorsTransfers = append(s.errorsTransfers, tr)
+				} else {
+					s.removeTransfer(&s.startedTransfers, tr, i)
+				}
 				break
 			}
 		}
